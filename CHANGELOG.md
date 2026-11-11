@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-10
+
+### Added
+- **Same-engine adoption, including Podman, only when an ID matches.**
+  In-place reuse runs only after a full 64-character container or network ID
+  is present on both Portainer and Arcane, or both Docker info IDs are equal.
+  Matching container names are not treated as the same server. Podman's info
+  ID changes on every query, so a mismatch there is ignored. When the IDs do
+  match, the wizard asks before reusing containers, networks, and volumes.
+  The answer is stored in the checkpoint, so `--resume` keeps it.
+  Adopted resources are not copied and are not added to the rollback script.
+  Podman is recognized when the engine root is `/var/lib/containers`.
+
+### Changed
+- **Portainer and Arcane's own apps are skipped unless you say otherwise.**
+  One prompt lists a container or stack that is Portainer (`portainer/portainer`,
+  `portainer/agent`, or the exact name `portainer`) or Arcane
+  (`getarcaneapp/arcane`, or the exact name `arcane`). The default is to
+  skip them, so pressing Enter leaves those management apps out of the
+  migration. Answering no migrates them with the workloads. A name that
+  only contains those words, such as `portainer-proxy`, is still migrated.
+  The answer is stored in the checkpoint. Arcane's containers already
+  running on the destination are not in the Portainer inventory, so they
+  are not recreated.
+- **Portainer and Arcane engines are detected separately.** Each server's
+  `/info` is classified as Docker or Podman. The wizard prints both after
+  the connections succeed, and the preflight table has a row for each.
+  When the kinds differ, container mounts are translated for the Arcane
+  engine: a Podman socket becomes `/var/run/docker.sock` on Docker, and a
+  Docker socket becomes `/run/podman/podman.sock` on Podman. When both
+  servers are the same kind, the socket path is left as it is. A volume
+  `_data` directory from either engine is mounted by volume name. The
+  export records the Portainer engine so a later import still knows it.
+  The banner line "Local Docker CLI" is the wizard machine, used for
+  volume backup, and is separate from either server.
+- **Connection prompts default to localhost.** Portainer defaults to
+  `https://localhost:9443/` and Arcane defaults to `http://localhost:3552/`.
+- **SSL verification defaults to no for a private address.** When the
+  Portainer URL host is a private, loopback, or link-local IP, "Verify SSL
+  certificate?" defaults to no. A hostname still defaults to yes. Pressing
+  Enter accepts the shown default.
+- **Dependencies install into `.venv`.** `migrate.py` and `migrate.sh` create
+  a virtual environment next to the script instead of pip-installing into
+  system Python. When the `venv` module is missing, they tell you to install
+  `python3-venv` (Debian/Ubuntu) or the `dnf` equivalent.
+
+### Fixed
+- **Podman bind modes are accepted by Docker.** Podman records kernel mount
+  flags such as `rbind`, `nosuid`, and `nodev` on `HostConfig.Binds`.
+  Docker rejects the whole string with `invalid mode`. Container creates
+  now keep only the modes Docker accepts. Propagation stays on a host
+  path and is omitted from a named volume, which rejects `BindOptions`.
+  A Podman socket bind is rewritten to `/var/run/docker.sock` when Arcane
+  is Docker and Portainer is Podman, or when the Portainer engine was not
+  detected. A Docker socket is rewritten to the Podman socket when Arcane
+  is Podman. When both servers are the same kind, the socket path stays.
+  Named volumes are mounted by volume name, not by the source host path
+  under `/var/lib/containers` or `/var/lib/docker`.
+- **A name that already exists is left in place.** A fresh Arcane install
+  already has its own `arcane_default` network. Creating it again returned
+  409 and was counted as a failed network. The wizard skips networks,
+  volumes, and projects that are already on Arcane, does not add a
+  rollback delete for them, and the preflight naming check lists those
+  names. A container is listed as left in place only when in-place reuse
+  is on. Otherwise the preflight row says that container will still be created.
+- **A projects-directory permission error stops the migration.** When
+  Arcane cannot create a project because its projects directory (often
+  `/opt/docker`) is not writable by the Arcane user, the wizard records
+  that stack, prints the ownership fix, and stops. Later stacks,
+  containers, and users are not attempted. The stacks phase stays
+  incomplete, so `--resume` retries it after the directory is writable.
+  The report and rollback script are still written for resources already
+  created. The process exits with status 1.
+- **A resumed run keeps the checkpoint.** The wizard asks for URLs before
+  it can tell which file belongs to this connection. It used to save a new
+  checkpoint from that empty start and overwrite the real one, so `--resume`
+  repeated finished work and asked the in-place question again. The saved
+  file is loaded once the Portainer endpoint and Arcane environment are
+  known, when its connection hash matches.
+- **Unverified HTTPS no longer prints a warning on every request.**
+  Answering no to "Verify SSL certificate?" silences urllib3's
+  `InsecureRequestWarning`. Certificate verification stays off for that
+  connection.
+- **A finished migration was reported as failed.** After the report and
+  `rollback.sh` were written, the wizard printed rollback instructions
+  through `MigrationEngine.console`, which does not exist. The resources
+  had already been migrated, and the rollback script was not executed.
+  The instructions now go through the wizard UI and say the script was
+  only written. A display error after every phase is complete no longer
+  prints "Migration failed" or rewrites the checkpoint.
+- **Arcane 2.17 user create rejected `roles`.** `POST /users` returns
+  `422 unexpected property` for a `roles` field, so every Portainer user
+  failed at the end of an otherwise in-place migration. The account is
+  created without that field, then the administrator or editor role is
+  applied with `PUT /users/{id}/role-assignments`.
+- **Arcane 2.x project create is multipart.** `POST /environments/{id}/projects`
+  rejects an `application/json` body with `422 cannot read multipart form`.
+  Stacks are now sent as the `project` and `manifest` form parts Arcane's UI
+  uses, so compose projects are actually created. Creating a project does not
+  redeploy it. When the compose project name matches containers already
+  running on that engine, Arcane attaches the project to them.
+
 ## [0.4.0] - 2026-04-21
 
 ### Fixed

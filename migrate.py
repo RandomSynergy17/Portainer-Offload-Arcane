@@ -11,7 +11,7 @@ Usage:
 See --help for full option list.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # ---------------------------------------------------------------------------
 # Dependency bootstrap -- runs before any third-party imports
@@ -23,10 +23,93 @@ import sys
 import os
 
 
+def _project_dir() -> str:
+    """Directory that contains this script. The project venv lives here."""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _venv_dir() -> str:
+    return os.path.join(_project_dir(), ".venv")
+
+
+def _venv_python(venv_dir: str) -> str:
+    if os.name == "nt":
+        return os.path.join(venv_dir, "Scripts", "python.exe")
+    return os.path.join(venv_dir, "bin", "python")
+
+
+def _in_virtualenv() -> bool:
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+
+def _missing_packages(python: str) -> list:
+    """Package names this interpreter cannot import. Empty when both import."""
+    code = (
+        "import importlib\n"
+        "missing = []\n"
+        "for name in ('rich', 'requests'):\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "    except ImportError:\n"
+        "        missing.append(name)\n"
+        "print('\\n'.join(missing))\n"
+    )
+    result = subprocess.run(
+        [python, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return ["rich", "requests"]
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _recommend_venv_package() -> None:
+    """Tell the user how to get the stdlib venv module."""
+    print()
+    print("Python's venv module is not installed, so dependencies")
+    print("cannot be installed into a virtual environment.")
+    print()
+    print("Install it, then run this again:")
+    if sys.platform.startswith("linux"):
+        print("  sudo apt install python3-venv    # Debian/Ubuntu")
+        print("  sudo dnf install python3-venv    # Fedora/RHEL")
+    elif sys.platform == "darwin":
+        print("  brew install python3")
+    else:
+        print("  Install the venv module for this Python (often python3-venv).")
+    print()
+
+
+def _manual_venv_help(venv_dir: str) -> None:
+    py = _venv_python(venv_dir)
+    pip = os.path.join(os.path.dirname(py), "pip")
+    req = os.path.join(_project_dir(), "requirements.txt")
+    print("Create a virtual environment and install them:")
+    print(f"  {sys.executable} -m venv {venv_dir}")
+    if os.path.isfile(req):
+        print(f"  {pip} install -r {req}")
+    else:
+        print(f"  {pip} install rich requests")
+    print(f"  {py} {os.path.abspath(__file__)}")
+
+
+def _venv_module_available() -> bool:
+    try:
+        import venv  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def check_dependencies():
     """Verify that required third-party packages are installed.
 
-    If any are missing, offer to install them via pip and restart the process.
+    Missing packages are installed into a ``.venv`` next to this script,
+    then the process restarts with that interpreter. An already-active
+    virtual environment is used as-is. When the stdlib ``venv`` module is
+    missing (Debian/Ubuntu without ``python3-venv``), tell the user how
+    to install it instead of pip-installing into the system Python.
     """
     missing = []
     for pkg in ("rich", "requests"):
@@ -34,34 +117,81 @@ def check_dependencies():
             importlib.import_module(pkg)
         except ImportError:
             missing.append(pkg)
-
     if not missing:
         return
 
+    venv_dir = _venv_dir()
+    venv_python = _venv_python(venv_dir)
+
+    # System Python is missing packages, but the project venv already has
+    # them. Switch over without asking again.
+    if not _in_virtualenv() and os.path.isfile(venv_python):
+        if not _missing_packages(venv_python):
+            result = subprocess.run([venv_python, *sys.argv])
+            sys.exit(result.returncode)
+
     print(f"Missing required packages: {', '.join(missing)}")
+    dest = "this virtual environment" if _in_virtualenv() else venv_dir
     try:
-        answer = input("Install them now with pip? [Y/n] ").strip().lower()
+        answer = input(f"Install them into {dest}? [Y/n] ").strip().lower()
     except EOFError:
-        print(
-            "No TTY to prompt for install. Install manually:\n"
-            f"  {sys.executable} -m pip install {' '.join(missing)}"
-        )
+        print("No TTY to prompt for install.")
+        print()
+        if _in_virtualenv():
+            print(f"  {sys.executable} -m pip install {' '.join(missing)}")
+        else:
+            _manual_venv_help(venv_dir)
         sys.exit(1)
-    if answer in ("", "y", "yes"):
-        # Dropped --quiet so pip failures (e.g. PEP 668 externally-managed)
-        # are visible to the user instead of silently cascading into an
-        # ImportError on restart.
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install"] + missing
-        )
-        print("Dependencies installed. Restarting...")
-        # os.execv has surprising behaviour on Windows (parent may return
-        # immediately). Spawn a fresh subprocess and exit with its code.
-        result = subprocess.run([sys.executable, *sys.argv])
-        sys.exit(result.returncode)
+    if answer not in ("", "y", "yes"):
+        print("Cannot continue without required packages.")
+        if not _in_virtualenv():
+            print()
+            _manual_venv_help(venv_dir)
+        sys.exit(1)
+
+    if _in_virtualenv():
+        target = sys.executable
+        install_cmd = [target, "-m", "pip", "install", *missing]
     else:
-        print("Cannot continue without required packages. Exiting.")
+        if not os.path.isfile(venv_python):
+            if not _venv_module_available():
+                _recommend_venv_package()
+                sys.exit(1)
+            print(f"Creating {venv_dir}", flush=True)
+            try:
+                subprocess.check_call([sys.executable, "-m", "venv", venv_dir])
+            except subprocess.CalledProcessError:
+                _recommend_venv_package()
+                sys.exit(1)
+            if not os.path.isfile(venv_python):
+                _recommend_venv_package()
+                sys.exit(1)
+        target = venv_python
+        req = os.path.join(_project_dir(), "requirements.txt")
+        install_cmd = [target, "-m", "pip", "install"]
+        if os.path.isfile(req):
+            install_cmd += ["-r", req]
+        else:
+            install_cmd += missing
+
+    # No --quiet: pip failures (missing ensurepip, network errors) stay
+    # visible instead of turning into an ImportError on restart.
+    try:
+        subprocess.check_call(install_cmd)
+    except subprocess.CalledProcessError:
+        if not _in_virtualenv():
+            print()
+            print("If pip is missing inside the new environment, install")
+            print("the venv package and remove the incomplete directory:")
+            print("  sudo apt install python3-venv    # Debian/Ubuntu")
+            print("  sudo dnf install python3-venv    # Fedora/RHEL")
+            print(f"  rm -rf {venv_dir}")
         sys.exit(1)
+    print("Dependencies installed. Restarting...", flush=True)
+    # os.execv has surprising behaviour on Windows (parent may return
+    # immediately). Spawn a fresh subprocess and exit with its code.
+    result = subprocess.run([target, *sys.argv])
+    sys.exit(result.returncode)
 
 
 check_dependencies()
@@ -93,6 +223,7 @@ from rich import box  # noqa: E402
 
 import argparse  # noqa: E402
 import hashlib  # noqa: E402
+import ipaddress  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import platform  # noqa: E402
@@ -101,10 +232,12 @@ import re  # noqa: E402
 import shlex  # noqa: E402
 import shutil  # noqa: E402
 import time  # noqa: E402
+import warnings  # noqa: E402
 from dataclasses import dataclass, field, asdict  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional, List, Dict, Any, Callable  # noqa: E402
+from urllib.parse import urlparse  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -156,6 +289,313 @@ def _redact_sensitive(obj: Any) -> Any:
         cls = type(obj)
         return cls(_redact_sensitive(v) for v in obj)
     return obj
+
+
+_PROJECTS_DIR_PERM_RE = re.compile(
+    r"projects directory\s+(\S+)\s+must be writable by uid\s+(\d+)",
+    re.IGNORECASE,
+)
+
+
+class MigrationStopped(Exception):
+    """The Arcane host will reject every remaining project create the same way.
+
+    ``action_item`` is the one-line note stored on the migration report.
+    """
+
+    def __init__(self, message: str, action_item: str):
+        super().__init__(message)
+        self.action_item = action_item
+
+
+def projects_directory_block(exc: BaseException) -> Optional["MigrationStopped"]:
+    """Return a stop signal when *exc* is Arcane's projects-directory 403.
+
+    Arcane creates each project as a subdirectory of its projects directory
+    (often ``/opt/docker``). When that directory is not writable by the
+    Arcane user, every later stack fails with the same permission error.
+    Other failures (name conflicts, bad mount options) return None so the
+    run can continue with the next resource.
+    """
+    text = str(exc)
+    lowered = text.lower()
+    directory_problem = (
+        "projects directory" in lowered
+        or "create project directory" in lowered
+        or "failed to create project directory" in lowered
+    )
+    permission_problem = (
+        "permission denied" in lowered or "must be writable" in lowered
+    )
+    if not (directory_problem and permission_problem):
+        return None
+
+    directory = ""
+    uid = ""
+    match = _PROJECTS_DIR_PERM_RE.search(text)
+    if match:
+        directory = match.group(1).rstrip(".,)")
+        uid = match.group(2)
+
+    if directory and uid:
+        lead = (
+            f"Arcane cannot create projects. {directory} must be writable "
+            f"by uid {uid}."
+        )
+        fix = (
+            "On the Arcane host, run:\n"
+            f"  sudo chown -R {uid}:{uid} {directory}\n"
+            f"  sudo chmod u+rwx {directory}\n"
+        )
+        action = (
+            f"Make {directory} writable by uid {uid}, then run with --resume."
+        )
+    else:
+        lead = (
+            "Arcane cannot create projects because the projects directory "
+            "is not writable."
+        )
+        fix = (
+            "On the Arcane host, make the projects directory writable by "
+            "the Arcane process user.\n"
+        )
+        action = (
+            "Make the Arcane projects directory writable by the Arcane "
+            "user, then run with --resume."
+        )
+    message = (
+        f"{lead}\n"
+        f"{fix}"
+        "Then resume this migration with --resume.\n"
+        "Resources already created are listed in the report and rollback script."
+    )
+    return MigrationStopped(message, action)
+
+
+# Docker rejects a bind mode when any token is unknown
+# ("invalid mode: rw,rprivate,rbind"). Podman inspect copies kernel mount
+# flags (rbind, nosuid, nodev, …) into HostConfig.Binds. Those flags are
+# not create options. Propagation is legal on a bind mount and illegal on
+# a named volume ("BindOptions must not be specified").
+_VOLUME_MOUNT_MODES = {"ro", "rw", "z", "Z", "nocopy"}
+_BIND_MOUNT_MODES = _VOLUME_MOUNT_MODES | {
+    "private", "rprivate",
+    "shared", "rshared",
+    "slave", "rslave",
+}
+
+_PODMAN_SOCKETS = {
+    "/run/podman/podman.sock",
+    "/var/run/podman/podman.sock",
+}
+_DOCKER_SOCKETS = {
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+}
+
+
+def _sanitize_mount_mode(mode: str, *, bind: bool) -> str:
+    """Keep only mount options the Docker create API accepts for this source."""
+    allowed = _BIND_MOUNT_MODES if bind else _VOLUME_MOUNT_MODES
+    kept = []
+    for part in (mode or "").split(","):
+        token = part.strip()
+        if token in allowed and token not in kept:
+            kept.append(token)
+    return ",".join(kept)
+
+
+_PODMAN_VOLUME_HOST = re.compile(
+    r"^/var/lib/containers/storage/volumes/([^/]+)/_data/?$"
+)
+_DOCKER_VOLUME_HOST = re.compile(
+    r"^/var/lib/docker/volumes/([^/]+)/_data/?$"
+)
+
+
+def classify_engine(info: Optional[dict]) -> str:
+    """Return ``podman``, ``docker``, or ``""`` when *info* is missing.
+
+    Podman's Docker-compatible ``/info`` reports a storage root under
+    ``/var/lib/containers``. Docker reports ``/var/lib/docker``. A Podman
+    init binary or a ``Name`` of ``podman`` counts when the root is absent.
+    """
+    if not isinstance(info, dict) or not info:
+        return ""
+    root = str(info.get("DockerRootDir") or "").replace("\\", "/").lower()
+    name = str(info.get("Name") or "").strip().lower()
+    init_bin = str(info.get("InitBinary") or "").lower()
+    if "/var/lib/containers" in root or "podman" in init_bin or name == "podman":
+        return "podman"
+    if root or info.get("ID") or info.get("ServerVersion"):
+        return "docker"
+    return ""
+
+
+def engine_summary(kind: str, info: Optional[dict]) -> str:
+    """One line for the preflight table. ``kind`` is podman, docker, or empty."""
+    if not kind:
+        return "not detected"
+    label = "Podman" if kind == "podman" else "Docker"
+    version = str((info or {}).get("ServerVersion") or "unknown")
+    root = str((info or {}).get("DockerRootDir") or "unknown root")
+    return f"{label} {version}, root {root}"
+
+
+def _named_volume_from_host_path(path: str) -> str:
+    """``.../volumes/<name>/_data`` is that named volume, not a bind path."""
+    for pattern in (_PODMAN_VOLUME_HOST, _DOCKER_VOLUME_HOST):
+        match = pattern.match(path or "")
+        if match:
+            return match.group(1)
+    return path
+
+
+def _rewrite_engine_socket(
+    source: str, source_engine: str, target_engine: str
+) -> str:
+    """Point an engine-socket bind at the destination engine.
+
+    When both sides are the same kind, the path is already right. When the
+    source kind is unknown, the path itself decides: a Podman socket is
+    rewritten for a Docker target, and a Docker socket for a Podman target.
+    """
+    path = (source or "").rstrip("/") or source
+    if source_engine and target_engine and source_engine == target_engine:
+        return source
+    source_is_podman = source_engine in ("", "podman")
+    source_is_docker = source_engine in ("", "docker")
+    if source_is_podman and target_engine == "docker" and path in _PODMAN_SOCKETS:
+        return "/var/run/docker.sock"
+    if source_is_docker and target_engine == "podman" and path in _DOCKER_SOCKETS:
+        return "/run/podman/podman.sock"
+    return source
+
+
+def normalize_bind_spec(
+    spec: str, target_engine: str = "", source_engine: str = ""
+) -> str:
+    """Turn one Podman or Docker bind into a spec the target engine accepts.
+
+    ``src:dst[:mode]``. The mode loses flags Docker rejects. Propagation
+    stays on a host path and is removed from a named volume. A volume
+    ``_data`` directory becomes the volume name. Sockets are rewritten
+    only when the two engines are different kinds.
+    """
+    parts = spec.split(":")
+    if len(parts) >= 2 and parts[0]:
+        parts[0] = _named_volume_from_host_path(parts[0])
+        parts[0] = _rewrite_engine_socket(parts[0], source_engine, target_engine)
+    # A mode does not contain a slash. A path in the last field is not a mode.
+    if len(parts) >= 3 and "/" not in parts[-1] and "\\" not in parts[-1]:
+        source = parts[0]
+        bind = source.startswith("/") or (len(source) > 2 and source[1] == ":")
+        mode = _sanitize_mount_mode(parts[-1], bind=bind)
+        head = ":".join(parts[:-1])
+        return f"{head}:{mode}" if mode else head
+    return ":".join(parts)
+
+
+def _name_conflict(exc: BaseException) -> bool:
+    """True when the engine rejected a create because the name is taken."""
+    text = str(exc).lower()
+    return "already exists" in text
+
+
+# Exact container or stack names. A workload that merely contains the word
+# (portainer-proxy, arcane-exporter) is not one of these apps.
+_MANAGEMENT_APP_NAMES = {
+    "portainer": "Portainer",
+    "portainer-ce": "Portainer",
+    "portainer-ee": "Portainer",
+    "portainer-agent": "Portainer",
+    "portainer_agent": "Portainer",
+    "arcane": "Arcane",
+}
+_MANAGEMENT_IMAGE_REPOS = (
+    ("portainer/portainer-ce", "Portainer"),
+    ("portainer/portainer-ee", "Portainer"),
+    ("portainer/portainer", "Portainer"),
+    ("portainer/agent", "Portainer"),
+    ("getarcaneapp/arcane", "Arcane"),
+)
+
+
+def _image_repo(image: str) -> str:
+    """``registry/org/name:tag`` -> ``org/name``, without a digest or tag."""
+    ref = (image or "").strip().lower()
+    if not ref or ref.startswith("sha256:"):
+        return ""
+    ref = ref.split("@", 1)[0]
+    last = ref.rsplit("/", 1)[-1]
+    if ":" in last:
+        ref = ref[: -(len(last.split(":", 1)[1]) + 1)]
+    for prefix in ("docker.io/", "ghcr.io/", "registry.hub.docker.com/"):
+        if ref.startswith(prefix):
+            ref = ref[len(prefix):]
+            break
+    return ref
+
+
+def container_image_ref(item: Any) -> str:
+    """Image tag from a container list entry or an inspect payload."""
+    if not isinstance(item, dict):
+        return ""
+    image = item.get("Image") or ""
+    if not isinstance(image, str) or image.startswith("sha256:"):
+        image = ""
+    if not image:
+        config = item.get("Config")
+        if isinstance(config, dict):
+            image = str(config.get("Image") or "")
+    return image
+
+
+def management_app(name: str, image: str = "") -> str:
+    """Return ``Portainer`` or ``Arcane`` when this is that product's own app.
+
+    Image match uses the repository. Name match is exact after a leading
+    slash. Other containers and stacks are workloads and stay in the migration.
+    """
+    repo = _image_repo(image)
+    for suffix, app in _MANAGEMENT_IMAGE_REPOS:
+        if repo == suffix or repo.endswith("/" + suffix):
+            return app
+    bare = (name or "").strip().lstrip("/").lower()
+    return _MANAGEMENT_APP_NAMES.get(bare, "")
+
+
+def _ssl_verify_default(url: str) -> bool:
+    """Whether "Verify SSL certificate?" should default to yes.
+
+    A private, loopback, or link-local address defaults to no. Those hosts
+    almost always present a certificate that is not publicly trusted.
+    A hostname, including localhost, still defaults to yes.
+    """
+    text = (url or "").strip()
+    if "://" not in text:
+        text = "https://" + text
+    host = urlparse(text).hostname or ""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    local = address.is_private or address.is_loopback or address.is_link_local
+    return not local
+
+
+def _quiet_unverified_https() -> None:
+    """Silence urllib3 after the user turns certificate verification off.
+
+    The wizard already asked and the user said no. urllib3 still prints
+    ``InsecureRequestWarning`` on every request to that host.
+    """
+    try:
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +694,8 @@ class PortainerClient:
         self.session = http_requests.Session()
         self.session.headers.update({"X-API-Key": config.portainer_api_key})
         self.session.verify = config.portainer_ssl_verify
+        if not config.portainer_ssl_verify:
+            _quiet_unverified_https()
         self.base_url = config.portainer_url.rstrip("/")
 
     # -- low-level helpers -------------------------------------------------
@@ -478,6 +920,8 @@ class ArcaneClient:
         self.logger = logger
         self.session = http_requests.Session()
         self.session.verify = config.arcane_ssl_verify
+        if not config.arcane_ssl_verify:
+            _quiet_unverified_https()
         self.base_url = config.arcane_url.rstrip("/") + "/api"
 
     # -- auth helpers ------------------------------------------------------
@@ -521,13 +965,17 @@ class ArcaneClient:
             timeout=timeout if timeout is not None else 60,
         )
         if not resp.ok:
-            # Let HTTPError propagate, but surface the server's error body so
-            # the caller and final report can include a useful reason.
+            # Include the response body in the exception text. raise_for_status()
+            # only says "422 Client Error", which hid the real reason
+            # (Arcane 2.x project create requires multipart, name conflicts, …).
             body_snippet = resp.text[:500] if resp.text else ""
             self.logger.error(
                 "%s %s -> %s: %s", method, url, resp.status_code, body_snippet
             )
-            resp.raise_for_status()
+            raise http_requests.HTTPError(
+                f"{resp.status_code} {resp.reason} for url: {url}: {body_snippet}",
+                response=resp,
+            )
         if resp.status_code == 204 or not resp.content:
             return {}
         ctype = resp.headers.get("Content-Type", "")
@@ -669,8 +1117,35 @@ class ArcaneClient:
     def list_projects(self, eid: str) -> List[Dict[str, Any]]:
         return self._list_paginated(f"/environments/{eid}/projects")
 
+    def get_docker_info(self, eid: str) -> Dict[str, Any]:
+        """Engine info for this environment. Podman reports a containers/storage root."""
+        data = self._get(f"/environments/{eid}/system/docker/info")
+        return data if isinstance(data, dict) else {}
+
     def create_project(self, eid: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        return self._post(f"/environments/{eid}/projects", json_data=data)
+        """Create a Compose project.
+
+        Arcane 2.x rejects an ``application/json`` body on this route with
+        422 ``cannot read multipart form``. The UI sends two JSON parts:
+        ``project`` (name, composeContent, envContent) and ``manifest``
+        (workspace file changes, empty when the compose file is the only input).
+        Creating the project does not redeploy. A project whose compose name
+        matches containers already running on this engine is attached to them.
+        """
+        project: Dict[str, Any] = {
+            "name": data.get("name", ""),
+            "composeContent": data.get("composeContent", ""),
+        }
+        if data.get("envContent") is not None:
+            project["envContent"] = data.get("envContent") or ""
+        manifest = {"fileChanges": data.get("fileChanges") or []}
+        files = {
+            "project": (None, json.dumps(project), "application/json"),
+            "manifest": (None, json.dumps(manifest), "application/json"),
+        }
+        return self._request(
+            "POST", f"/environments/{eid}/projects", files=files
+        )
 
     # -- GitOps ------------------------------------------------------------
 
@@ -729,6 +1204,20 @@ class ArcaneClient:
 
     def create_user(self, data: Dict[str, Any]) -> Dict[str, Any]:
         return self._post("/users", json_data=data)
+
+    def set_user_role_assignments(
+        self, user_id: str, assignments: List[Dict[str, Any]]
+    ) -> Any:
+        """Replace a user's manual role assignments.
+
+        Arcane 2.17 rejects a ``roles`` field on ``POST /users`` with
+        422 ``unexpected property``. Roles are applied with this call.
+        Omit ``environmentId`` on an assignment for a global role.
+        """
+        return self._put(
+            f"/users/{user_id}/role-assignments",
+            json_data={"assignments": assignments},
+        )
 
     # -- Webhooks ----------------------------------------------------------
 
@@ -851,7 +1340,12 @@ class WizardUI:
         )
         banner_text.append(f"  |  Platform: {self.config.platform_name}", style="dim")
         banner_text.append(
-            f"  |  Docker: {'[green]available[/green]' if self.config.has_docker else '[yellow]not found[/yellow]'}",
+            "  |  Local Docker CLI: "
+            + (
+                "[green]available[/green]"
+                if self.config.has_docker
+                else "[yellow]not found[/yellow]"
+            ),
             style="dim",
         )
         if self.config.log_file:
@@ -899,6 +1393,18 @@ class WizardUI:
     def error(self, msg: str):
         """Red cross prefix."""
         self.console.print(f"  [red]\u2718[/red] {msg}")
+
+    def show_migration_stopped(self, message: str):
+        """Explain why the run halted and how to resume after the fix."""
+        self.console.print()
+        self.console.print(
+            Panel(
+                message,
+                title="[bold red]Migration stopped[/bold red]",
+                border_style="red",
+            )
+        )
+        self.console.print()
 
     def info(self, msg: str):
         """Blue info prefix."""
@@ -994,13 +1500,14 @@ class WizardUI:
         self.console.print("\n[bold cyan]Portainer Connection[/bold cyan]")
         self.config.portainer_url = Prompt.ask(
             "  [blue]Portainer URL[/blue]",
-            default="https://portainer.example.com:9443",
+            default="https://localhost:9443/",
         )
         self.config.portainer_api_key = Prompt.ask(
             "  [blue]API Key[/blue]", password=True
         )
         self.config.portainer_ssl_verify = Confirm.ask(
-            "  [blue]Verify SSL certificate?[/blue]", default=True
+            "  [blue]Verify SSL certificate?[/blue]",
+            default=_ssl_verify_default(self.config.portainer_url),
         )
 
     def ask_arcane_connection(self):
@@ -1008,7 +1515,7 @@ class WizardUI:
         self.console.print("\n[bold cyan]Arcane Connection[/bold cyan]")
         self.config.arcane_url = Prompt.ask(
             "  [blue]Arcane URL[/blue]",
-            default="https://arcane.example.com",
+            default="http://localhost:3552/",
         )
         auth_method = Prompt.ask(
             "  [blue]Auth method[/blue]",
@@ -1270,7 +1777,7 @@ class WizardUI:
             f"[bold]Strategy:[/bold]       {config.strategy}",
             f"[bold]Dry run:[/bold]        {'[yellow]Yes[/yellow]' if config.dry_run else '[green]No[/green]'}",
             f"[bold]Backup dir:[/bold]     [dim]{config.backup_dir}[/dim]",
-            f"[bold]Docker local:[/bold]   {'[green]available[/green]' if config.has_docker else '[yellow]not available[/yellow]'}",
+            f"[bold]Local Docker CLI:[/bold] {'[green]available[/green]' if config.has_docker else '[yellow]not available[/yellow]'} (volume backup on this machine)",
             "",
             "[bold]Execution order:[/bold]",
         ]
@@ -1413,6 +1920,22 @@ class WizardUI:
 
         self.console.print()
 
+    def show_rollback_instructions(self, rollback_file: str):
+        """Explain that rollback.sh was written and has not been executed.
+
+        The script ships with a placeholder API key so no credentials are
+        written to disk. It deletes only resources this run created.
+        """
+        self.info(f"Rollback script written (not run): {rollback_file}")
+        self.console.print(
+            "\n[bold yellow]The rollback script was not executed.[/bold yellow]\n"
+            f"  1. Edit [cyan]{rollback_file}[/cyan] and replace "
+            "[magenta]YOUR_API_KEY_HERE[/magenta] with your Arcane API key.\n"
+            "  2. Review the DELETE commands. They remove resources this run created.\n"
+            f"  3. Run it only if you want to undo those creates: "
+            f"[cyan]bash {rollback_file}[/cyan]"
+        )
+
 
 # ---------------------------------------------------------------------------
 # ReportGenerator
@@ -1448,17 +1971,33 @@ class ReportGenerator:
                 "items": [],
             }
 
-    def record_success(self, resource_type: str, name: str, source_id: Any, target_id: Any):
-        """Track a successful migration."""
+    def record_success(
+        self,
+        resource_type: str,
+        name: str,
+        source_id: Any,
+        target_id: Any,
+        status: str = "migrated",
+    ):
+        """Track a successful migration.
+
+        ``status="adopted"`` means the resource was already on the target
+        engine and was left in place. It still counts as migrated, and no
+        rollback command is recorded for it.
+        """
         self._ensure_resource(resource_type)
         self.report["resources"][resource_type]["migrated"] += 1
         self.report["resources"][resource_type]["items"].append({
             "name": name,
             "source_id": source_id,
             "target_id": target_id,
-            "status": "migrated",
+            "status": status,
         })
-        self.logger.info("Migrated %s: %s (source=%s -> target=%s)", resource_type, name, source_id, target_id)
+        verb = "Adopted" if status == "adopted" else "Migrated"
+        self.logger.info(
+            "%s %s: %s (source=%s -> target=%s)",
+            verb, resource_type, name, source_id, target_id,
+        )
 
     def record_failure(self, resource_type: str, name: str, error: str):
         """Track a failed migration."""
@@ -1576,6 +2115,26 @@ class MigrationEngine:
         self._ee_exported: bool = False
         self.state = self._load_state()
         self.discovery: Dict[str, Any] = {}
+        # Filled by _refresh_target_engine once both APIs are connected.
+        # engine_kind / engine_info are the Arcane side. source_* is Portainer.
+        self.engine_kind: str = ""
+        self.engine_info: Dict[str, Any] = {}
+        self.source_engine_kind: str = ""
+        self.source_engine_info: Dict[str, Any] = {}
+        self.same_engine: bool = False
+        self.engine_proven: bool = False
+        self.engine_match_reason: str = ""
+        # None until the user answers. False means proven, but they declined.
+        # A bool in state["adopt_in_place"] is that answer from a previous run.
+        self._adopt_in_place: Optional[bool] = None
+        self._target_names: Dict[str, set] = {
+            "containers": set(),
+            "networks": set(),
+            "volumes": set(),
+            "projects": set(),
+        }
+        self._engine_noted: bool = False
+        self._engines_announced: bool = False
 
     # ------------------------------------------------------------------
     # Task 7: Checkpoint & State Management
@@ -1620,6 +2179,42 @@ class MigrationEngine:
             "phases": {phase: "pending" for phase in self.PHASES},
             "migrated_items": {phase: [] for phase in self.PHASES},
         }
+
+    def _attach_checkpoint(self) -> None:
+        """Load the checkpoint once the connection identity is known.
+
+        The engine is built before the wizard asks for URLs, so the load in
+        ``__init__`` compares the file to an empty connection and misses.
+        Saving that empty state would replace the file. When the Portainer
+        endpoint and Arcane environment are known, reload a file whose hash
+        matches so a resume keeps migrated items and saved answers.
+        """
+        current = self.config.config_hash()
+        cp = self.config.checkpoint_file
+        if os.path.isfile(cp):
+            try:
+                with open(cp, "r", encoding="utf-8") as fh:
+                    saved = json.load(fh)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"Checkpoint file {cp} is corrupt ({exc}). "
+                    f"Inspect the file manually; if you intend to start "
+                    f"fresh, delete it and re-run."
+                ) from exc
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Could not read checkpoint {cp}: {exc}"
+                ) from exc
+            if isinstance(saved, dict) and saved.get("config_hash") == current:
+                self.state = saved
+                self._git_repo_map = saved.get("git_repo_map", {}) or {}
+                self.logger.info("Checkpoint matches this connection: %s", cp)
+                return
+            self.logger.warning(
+                "Checkpoint config_hash mismatch -- starting fresh"
+            )
+        self.state["config_hash"] = current
+        self._save_state()
 
     def _save_state(self):
         """Atomically write state to checkpoint file.
@@ -1685,6 +2280,98 @@ class MigrationEngine:
         """
         return resource_type in self.config.selected_items
 
+    def _management_candidate_lines(self) -> List[str]:
+        """Portainer and Arcane apps still in scope, for the skip prompt."""
+        lines: List[str] = []
+        seen = set()
+
+        def add(kind: str, name: str, image: str = "") -> None:
+            app = management_app(name, image)
+            if not app or not name:
+                return
+            label = f"{app} {kind} '{name}'"
+            if label not in seen:
+                seen.add(label)
+                lines.append(label)
+
+        if self._should_include("stacks"):
+            for stack in self.discovery.get("stacks", {}).get("data", []) or []:
+                if isinstance(stack, dict):
+                    add("stack", str(stack.get("Name") or ""))
+        if self._should_include("standalone_containers"):
+            for container in (
+                self.discovery.get("standalone_containers", {}).get("data", [])
+                or []
+            ):
+                if not isinstance(container, dict):
+                    continue
+                add(
+                    "container",
+                    self._resource_name(
+                        container, "Names", "names", "Name", "name"
+                    ),
+                    container_image_ref(container),
+                )
+        return lines
+
+    def _skip_management_apps(self) -> bool:
+        """True when Portainer and Arcane's own apps should be left out.
+
+        Asked once. The default is to skip. The answer is stored in the
+        checkpoint so a resume does not ask again and does not flip the choice.
+        """
+        decided = self.state.get("skip_management_containers")
+        if isinstance(decided, bool):
+            return decided
+        found = self._management_candidate_lines()
+        if not found:
+            return False
+        self.ui.info(
+            "These are the management apps, not workloads: " + ", ".join(found)
+        )
+        try:
+            skip = Confirm.ask(
+                "  [blue]Skip Portainer and Arcane's own containers?[/blue]",
+                default=True,
+            )
+        except EOFError:
+            skip = True
+            self.ui.warning(
+                "No answer. Portainer and Arcane's own containers will be skipped."
+            )
+        self.state["skip_management_containers"] = skip
+        self._save_state()
+        if skip:
+            self.ui.info(
+                "Portainer and Arcane's own containers will be skipped."
+            )
+        else:
+            self.ui.info(
+                "Portainer and Arcane's own containers will be migrated."
+            )
+        return skip
+
+    def _leave_management_app(
+        self,
+        resource_type: str,
+        name: str,
+        item_id: str,
+        phase: str,
+        image: str = "",
+    ) -> bool:
+        """Skip one Portainer or Arcane app. No create and no rollback delete."""
+        app = management_app(name, image)
+        if not app or not self._skip_management_apps():
+            return False
+        self.report.record_skip(
+            resource_type,
+            name,
+            f"{app}'s own app, skipped",
+        )
+        self.ui.info(f"Skipping {app} '{name}'")
+        self._record_migrated(phase, item_id)
+        return True
+
     def _is_ee(self) -> bool:
         """Shorthand for Enterprise Edition check."""
         return self.config.portainer_edition == "EE"
@@ -1709,6 +2396,20 @@ class MigrationEngine:
             )
             return {"dry_run": True, "action": action}
         return api_call(*args, **kwargs)
+
+    def _stop_if_projects_directory_blocked(self, exc: BaseException) -> None:
+        """Halt the run when Arcane cannot create project directories.
+
+        A projects-directory permission error is a property of the Arcane
+        host. The next stack fails the same way, so the remaining phases
+        are not attempted. The failed item is already recorded by the caller.
+        """
+        stopped = projects_directory_block(exc)
+        if stopped is None:
+            return
+        self.report.add_action_item(stopped.action_item)
+        self.ui.show_migration_stopped(str(stopped))
+        raise stopped
 
     # ------------------------------------------------------------------
     # Import from directory (--import-dir)
@@ -1745,6 +2446,7 @@ class MigrationEngine:
         # Carry forward edition info so _is_ee() works
         self.config.portainer_edition = manifest.get("portainer_edition", "CE")
         self.config.portainer_version = manifest.get("portainer_version", "")
+        self._remember_source_engine(manifest.get("source_engine"))
 
         counts = manifest.get("counts", {})
         discovery: Dict[str, Any] = {}
@@ -2237,6 +2939,54 @@ class MigrationEngine:
             "enabled": True,
         }
 
+    def _container_bind_specs(
+        self,
+        mounts_raw: list,
+        host_config: dict,
+    ) -> List[str]:
+        """Bind specs Arcane can pass to Docker.
+
+        Prefers HostConfig.Binds because a named volume appears there by
+        name. Mount.Source for a volume is the engine's host directory.
+        """
+        target = self.engine_kind or ""
+        source = self.source_engine_kind or ""
+        raw_binds = [
+            bind for bind in (host_config.get("Binds") or [])
+            if isinstance(bind, str) and bind.strip()
+        ]
+        if raw_binds:
+            return [
+                normalize_bind_spec(bind, target, source) for bind in raw_binds
+            ]
+
+        specs: List[str] = []
+        for mount in mounts_raw or []:
+            if not isinstance(mount, dict):
+                continue
+            dest = mount.get("Destination") or ""
+            mount_type = (mount.get("Type") or "").lower()
+            if mount_type == "volume":
+                src = mount.get("Name") or ""
+            else:
+                src = mount.get("Source") or ""
+            if not src or not dest:
+                continue
+            mode = mount.get("Mode") or ""
+            if not mode:
+                bits = []
+                if mount.get("RW") is False:
+                    bits.append("ro")
+                propagation = mount.get("Propagation") or ""
+                if propagation:
+                    bits.append(propagation)
+                mode = ",".join(bits)
+            spec = f"{src}:{dest}"
+            if mode:
+                spec = f"{spec}:{mode}"
+            specs.append(normalize_bind_spec(spec, target, source))
+        return specs
+
     def _transform_network(self, net: dict) -> dict:
         """Map a Portainer/Docker network to Arcane network create payload.
 
@@ -2306,32 +3056,18 @@ class MigrationEngine:
                 for binding in (host_list or [])
             ]
 
-        # --- Binds ---
-        binds = host_config.get("Binds", []) or []
-
         # --- Restart policy ---
         restart_policy = host_config.get("RestartPolicy", {}) or {}
 
         # --- Exposed ports ---
         exposed_ports = config.get("ExposedPorts", {}) or {}
 
-        # --- Volumes as list of strings (Source:Destination:Mode) ---
-        volume_strings: List[str] = []
-        for mount in mounts_raw:
-            src = mount.get("Source", "")
-            dst = mount.get("Destination", "")
-            mode = mount.get("Mode", "")
-            if src and dst:
-                entry_str = f"{src}:{dst}"
-                if mode:
-                    entry_str += f":{mode}"
-                volume_strings.append(entry_str)
-            elif dst:
-                volume_strings.append(dst)
-        # Also add any Binds not already represented
-        for bind in binds:
-            if bind not in volume_strings:
-                volume_strings.append(bind)
+        # Named volumes use the volume name, not the source host path.
+        # Podman stores that path under /var/lib/containers, which does not
+        # exist on a Docker host. Binds carry the name and are preferred.
+        # Arcane forwards hostConfig.binds when it is non-empty, otherwise
+        # the volumes list, so both must be the same sanitized specs.
+        volume_strings = self._container_bind_specs(mounts_raw, host_config)
 
         # --- Restart policy as string ---
         restart_name = restart_policy.get("Name", "")
@@ -2363,7 +3099,7 @@ class MigrationEngine:
             "hostConfig": {
                 "networkMode": host_config.get("NetworkMode", "default"),
                 "portBindings": port_bindings,
-                "binds": binds,
+                "binds": volume_strings,
                 "memory": host_config.get("Memory") or 0,
                 "memorySwap": host_config.get("MemorySwap") or 0,
                 "nanoCpus": host_config.get("NanoCpus") or 0,
@@ -2399,19 +3135,20 @@ class MigrationEngine:
     def _transform_user(self, user: dict) -> dict:
         """Map Portainer user to Arcane user create payload.
 
-        Role mapping: 1 = admin, 2 = user.
-        Passwords cannot be migrated -- uses a default placeholder.
+        Arcane 2.17's create schema has no ``roles`` field and rejects one
+        with 422. ``roleId`` is stripped by the caller and sent to
+        ``PUT /users/{id}/role-assignments`` after the account exists.
+        Portainer role 1 is the administrator. Role 2 is a standard user,
+        mapped to Arcane's editor role (read/write on Docker resources).
+        Passwords cannot be migrated.
         """
-        role = user.get("Role", 2)
-        if role == 1:
-            roles = ["admin"]
-        else:
-            roles = ["user"]
-
+        role_id = "role_admin" if user.get("Role", 2) == 1 else "role_editor"
+        username = user.get("Username", "")
         return {
-            "username": user.get("Username", ""),
+            "username": username,
             "password": secrets.token_urlsafe(16),
-            "roles": roles,
+            "displayName": username,
+            "roleId": role_id,
         }
 
     # ------------------------------------------------------------------
@@ -2424,12 +3161,14 @@ class MigrationEngine:
         Called before any live migration writes.  Respects ``config.dry_run``
         (no files written) and ``_should_include()`` (user scope selection).
         """
+        self._load_engine_sides()
         base = Path(self.config.backup_dir)
         manifest: Dict[str, Any] = {
             "tool_version": __version__,
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "portainer_edition": self.config.portainer_edition,
             "portainer_version": self.config.portainer_version,
+            "source_engine": self._source_engine_record(),
             "counts": {},
         }
 
@@ -2781,6 +3520,8 @@ class MigrationEngine:
             if self._is_migrated(phase, stack_id):
                 self.report.record_skip("Git Repos", name, "already migrated")
                 continue
+            if self._leave_management_app("Git Repos", name, stack_id, phase):
+                continue
             try:
                 payload = self._transform_git_config_to_repo(stack)
                 result = self._execute_or_log(
@@ -2805,6 +3546,314 @@ class MigrationEngine:
 
         self._mark_phase(phase, "completed")
 
+    @staticmethod
+    def _resource_name(item: dict, *keys: str) -> str:
+        """First non-empty name from the given keys. Lists use the first entry."""
+        for key in keys:
+            value = item.get(key)
+            if isinstance(value, list) and value:
+                value = value[0]
+            if isinstance(value, str) and value.strip():
+                return value.strip().lstrip("/")
+        return ""
+
+    @staticmethod
+    def _canonical_resource_id(value: Any) -> str:
+        """Return a full 64-hex Docker/Podman ID, or "" when it is not one.
+
+        Short IDs and display names are rejected. A 64-hex ID is what the
+        engine assigned to that object. The same value on both APIs is the
+        same object, not a name that happens to match on another host.
+        """
+        raw = str(value or "").strip().lower()
+        if raw.startswith("sha256:"):
+            raw = raw[7:]
+        if len(raw) == 64 and all(ch in "0123456789abcdef" for ch in raw):
+            return raw
+        return ""
+
+    def _ids_from(self, items: list, *keys: str) -> set:
+        found = set()
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            for key in keys:
+                canonical = self._canonical_resource_id(item.get(key))
+                if canonical:
+                    found.add(canonical)
+                    break
+        return found
+
+    def _source_container_names(self) -> set:
+        """Container names from discovery. Used only to warn about name clashes."""
+        names = set()
+        for container in self.discovery.get("standalone_containers", {}).get("data", []) or []:
+            name = self._resource_name(container, "Names", "names", "Name", "name")
+            if name:
+                names.add(name.lower())
+        for stack in self.discovery.get("stacks", {}).get("data", []) or []:
+            name = self._resource_name(stack, "Name", "name")
+            if name:
+                names.add(name.lower())
+        return names
+
+    def _source_identity_ids(self) -> tuple:
+        """Container and network IDs from the live Portainer engine, plus the export.
+
+        The live list includes compose containers. Discovery's standalone list
+        omits those, and an export can be stale, so a connected Portainer wins.
+        """
+        containers: list = []
+        networks: list = []
+        if self.config.portainer_url:
+            try:
+                listed = self.portainer.list_containers(all_containers=True)
+                if isinstance(listed, list):
+                    containers.extend(listed)
+            except Exception as exc:
+                self.logger.warning("Could not list Portainer containers: %s", exc)
+            try:
+                listed_nets = self.portainer.list_networks()
+                if isinstance(listed_nets, list):
+                    networks.extend(listed_nets)
+            except Exception as exc:
+                self.logger.warning("Could not list Portainer networks: %s", exc)
+        containers.extend(
+            self.discovery.get("standalone_containers", {}).get("data", []) or []
+        )
+        networks.extend(self.discovery.get("networks", {}).get("data", []) or [])
+        return (
+            self._ids_from(containers, "Id", "id"),
+            self._ids_from(networks, "Id", "id"),
+        )
+
+    def _engine_pair_message(self) -> str:
+        """One line naming the engine behind Portainer and the engine behind Arcane."""
+        source = engine_summary(self.source_engine_kind, self.source_engine_info)
+        target = engine_summary(self.engine_kind, self.engine_info)
+        if self.source_engine_kind and self.engine_kind:
+            if self.source_engine_kind == self.engine_kind:
+                label = "Podman" if self.source_engine_kind == "podman" else "Docker"
+                relation = f"Both servers are {label}."
+            else:
+                src = "Podman" if self.source_engine_kind == "podman" else "Docker"
+                dst = "Podman" if self.engine_kind == "podman" else "Docker"
+                relation = (
+                    f"Portainer is {src} and Arcane is {dst}. "
+                    "Container mounts will be translated for the Arcane engine."
+                )
+        elif self.source_engine_kind:
+            relation = "Arcane did not return engine info."
+        elif self.engine_kind:
+            relation = "Portainer did not return engine info."
+        else:
+            relation = "Neither server returned engine info."
+        return f"Portainer engine: {source}. Arcane engine: {target}. {relation}"
+
+    def _remember_source_engine(self, saved: Any) -> None:
+        """Restore the Portainer engine recorded in an export manifest."""
+        if not isinstance(saved, dict) or not saved:
+            return
+        info = {
+            "ServerVersion": str(saved.get("serverVersion") or ""),
+            "DockerRootDir": str(saved.get("dockerRootDir") or ""),
+            "Name": str(saved.get("name") or ""),
+            "InitBinary": str(saved.get("initBinary") or ""),
+        }
+        kind = str(saved.get("kind") or "").strip().lower()
+        if kind not in ("podman", "docker"):
+            kind = classify_engine(info)
+        if not kind:
+            return
+        self.source_engine_info = info
+        self.source_engine_kind = kind
+
+    def _source_engine_record(self) -> Dict[str, str]:
+        """Fields written to the export so a later import still knows the source."""
+        info = self.source_engine_info or {}
+        return {
+            "kind": self.source_engine_kind or "",
+            "serverVersion": str(info.get("ServerVersion") or ""),
+            "dockerRootDir": str(info.get("DockerRootDir") or ""),
+            "name": str(info.get("Name") or ""),
+            "initBinary": str(info.get("InitBinary") or ""),
+        }
+
+    def _load_engine_sides(self) -> None:
+        """Classify the Portainer engine and the Arcane engine.
+
+        The two hosts are read separately. A failed read keeps a source
+        classification already loaded from an export. The pair is printed
+        once, the first time this runs.
+        """
+        eid = self.config.arcane_environment_id or "0"
+        try:
+            fetched = self.arcane.get_docker_info(eid) or {}
+        except Exception as exc:
+            self.logger.warning("Could not read Arcane engine info: %s", exc)
+            fetched = None
+        if isinstance(fetched, dict) and fetched:
+            self.engine_info = fetched
+            self.engine_kind = classify_engine(fetched)
+
+        if self.config.portainer_url:
+            try:
+                source = self.portainer.get_docker_info() or {}
+            except Exception as exc:
+                self.logger.warning(
+                    "Could not read Portainer engine info: %s", exc
+                )
+                source = None
+            if isinstance(source, dict) and source:
+                self.source_engine_info = source
+                self.source_engine_kind = classify_engine(source)
+
+        if not self._engines_announced:
+            self.ui.info(self._engine_pair_message())
+            self._engines_announced = True
+
+    def _refresh_target_engine(self) -> None:
+        """Detect both engines, and whether both APIs see the same one.
+
+        Same-engine adoption turns on only when a full container or network ID
+        is present on both sides, or when both Docker info IDs are present and
+        equal. Podman returns a new info ID on every query, so a mismatch
+        there is ignored. Matching names are never enough. Matching engine
+        kinds are not enough either: Podman on one host and Docker on another
+        is a normal migration.
+        """
+        self._load_engine_sides()
+        info = self.engine_info if isinstance(self.engine_info, dict) else {}
+        eid = self.config.arcane_environment_id or "0"
+        root = str(info.get("DockerRootDir") or "")
+
+        def _collect(items: list, *keys: str) -> set:
+            found = set()
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                name = self._resource_name(item, *keys)
+                if name:
+                    found.add(name.lower())
+            return found
+
+        def _safe_list(loader: Callable) -> list:
+            try:
+                listed = loader()
+            except Exception as exc:
+                self.logger.warning("Could not list target resources: %s", exc)
+                return []
+            return listed if isinstance(listed, list) else []
+
+        containers = _safe_list(lambda: self.arcane.list_containers(eid))
+        networks = _safe_list(lambda: self.arcane.list_networks(eid))
+        volumes = _safe_list(lambda: self.arcane.list_volumes(eid))
+        projects = _safe_list(lambda: self.arcane.list_projects(eid))
+        self._target_names = {
+            "containers": _collect(containers, "names", "Names", "name", "Name"),
+            "networks": _collect(networks, "name", "Name"),
+            "volumes": _collect(volumes, "name", "Name"),
+            "projects": _collect(projects, "name", "Name"),
+        }
+        source_containers, source_networks = self._source_identity_ids()
+        target_containers = self._ids_from(containers, "Id", "id")
+        target_networks = self._ids_from(networks, "Id", "id")
+        container_hits = len(source_containers & target_containers)
+        network_hits = len(source_networks & target_networks)
+
+        source_engine_id = str(
+            (self.source_engine_info or {}).get("ID") or ""
+        ).strip()
+        target_engine_id = str(info.get("ID") or "").strip()
+        # Docker stores a stable daemon ID. Podman invents a new UUID per
+        # /info call, so equal IDs are evidence and unequal IDs are not.
+        engine_id_match = bool(
+            source_engine_id
+            and target_engine_id
+            and source_engine_id.lower() == target_engine_id.lower()
+        )
+
+        parts = []
+        if container_hits:
+            parts.append(f"{container_hits} container ID{'s' if container_hits != 1 else ''}")
+        if network_hits:
+            parts.append(f"{network_hits} network ID{'s' if network_hits != 1 else ''}")
+        if engine_id_match:
+            parts.append("Docker engine ID")
+        self.engine_proven = bool(parts)
+        self.engine_match_reason = (
+            " and ".join(parts) + " match on both APIs"
+            if parts else "no shared container, network, or engine ID"
+        )
+
+        kind = {"podman": "Podman", "docker": "Docker"}.get(
+            self.engine_kind, "container"
+        )
+        if self.engine_proven and self._adopt_in_place is None:
+            saved = self.state.get("adopt_in_place")
+            if isinstance(saved, bool):
+                self._adopt_in_place = saved
+            else:
+                self.ui.info(
+                    f"Portainer and Arcane are the same {kind} engine: "
+                    f"{self.engine_match_reason}."
+                )
+                try:
+                    self._adopt_in_place = Confirm.ask(
+                        "  [blue]Reuse the containers, networks, and volumes "
+                        "already on that engine?[/blue]",
+                        default=True,
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    self._adopt_in_place = False
+                    self.ui.warning(
+                        "No answer on in-place reuse. Resources will be created, not reused."
+                    )
+                self.state["adopt_in_place"] = self._adopt_in_place
+                self._save_state()
+        self.same_engine = bool(self.engine_proven and self._adopt_in_place)
+
+        names_overlap = bool(
+            self._source_container_names() & self._target_names["containers"]
+        )
+        if not self._engine_noted:
+            if self.same_engine:
+                server = str(info.get("ServerVersion") or "unknown")
+                self.ui.info(
+                    f"In-place reuse is on ({kind} {server}, root {root or 'unknown'}). "
+                    "Existing containers, networks, and volumes will be kept."
+                )
+                self.report.add_action_item(
+                    f"Arcane is attached to the same {kind} engine "
+                    f"({self.engine_match_reason}). Existing containers, networks, "
+                    "and volumes were left in place and were not copied. Compose "
+                    "stacks were registered as Arcane projects so the already-running "
+                    "containers show up under Projects."
+                )
+            elif self.engine_proven:
+                self.ui.warning(
+                    "Same engine was confirmed, and in-place reuse is off. "
+                    "Creating resources may fail because those names are already taken."
+                )
+            elif names_overlap:
+                self.ui.warning(
+                    "Some container names already exist on Arcane, but no container "
+                    "or network ID matches. They are treated as a different server."
+                )
+            self._engine_noted = True
+
+    def _name_taken(self, kind: str, name: str) -> bool:
+        """True when Arcane already lists this name. Names are not identity."""
+        if not name:
+            return False
+        return name.lower() in self._target_names.get(kind, set())
+
+    def _already_on_engine(self, kind: str, name: str) -> bool:
+        """True when same-engine mode should keep this named resource as-is."""
+        if not self.same_engine or not name:
+            return False
+        return self._name_taken(kind, name)
+
     def _migrate_networks(self):
         """Migrate user-defined networks to Arcane."""
         phase = "networks"
@@ -2826,6 +3875,27 @@ class MigrationEngine:
             if self._is_migrated(phase, net_id):
                 self.report.record_skip("Networks", name, "already migrated")
                 continue
+            if self._name_taken("networks", name):
+                # Same-engine adoption reuses the live network. A name that
+                # already exists on another host (Arcane's own arcane_default,
+                # for example) cannot be created again. Leave it, and do not
+                # add a rollback delete for a network this run did not create.
+                if self._already_on_engine("networks", name):
+                    self.report.record_success(
+                        "Networks", name, net_id, name, status="adopted"
+                    )
+                    self.ui.info(
+                        f"Network '{name}' already on this engine -- left in place"
+                    )
+                else:
+                    self.report.record_skip(
+                        "Networks", name, "already exists on target"
+                    )
+                    self.ui.info(
+                        f"Network '{name}' already exists on Arcane -- left in place"
+                    )
+                self._record_migrated(phase, net_id)
+                continue
             try:
                 payload = self._transform_network(net)
                 result = self._execute_or_log(
@@ -2844,6 +3914,15 @@ class MigrationEngine:
                     )
                 self._record_migrated(phase, net_id)
             except Exception as exc:
+                if _name_conflict(exc):
+                    self.report.record_skip(
+                        "Networks", name, "already exists on target"
+                    )
+                    self.ui.info(
+                        f"Network '{name}' already exists on Arcane -- left in place"
+                    )
+                    self._record_migrated(phase, net_id)
+                    continue
                 self.logger.error("Failed to migrate network %s: %s", name, exc)
                 self.report.record_failure("Networks", name, str(exc))
                 self.ui.error(f"Network '{name}' failed: {exc}")
@@ -2869,6 +3948,25 @@ class MigrationEngine:
             name = vol.get("Name", "")
             if self._is_migrated(phase, name):
                 self.report.record_skip("Volumes", name, "already migrated")
+                continue
+            if self._name_taken("volumes", name):
+                # Recreating the volume or uploading a tarball would not move
+                # data, and a rollback delete would destroy the live volume.
+                if self._already_on_engine("volumes", name):
+                    self.report.record_success(
+                        "Volumes", name, name, name, status="adopted"
+                    )
+                    self.ui.info(
+                        f"Volume '{name}' already on this engine -- left in place"
+                    )
+                else:
+                    self.report.record_skip(
+                        "Volumes", name, "already exists on target"
+                    )
+                    self.ui.info(
+                        f"Volume '{name}' already exists on Arcane -- left in place"
+                    )
+                self._record_migrated(phase, name)
                 continue
             try:
                 payload = {
@@ -2917,6 +4015,15 @@ class MigrationEngine:
                         )
                 self._record_migrated(phase, name)
             except Exception as exc:
+                if _name_conflict(exc):
+                    self.report.record_skip(
+                        "Volumes", name, "already exists on target"
+                    )
+                    self.ui.info(
+                        f"Volume '{name}' already exists on Arcane -- left in place"
+                    )
+                    self._record_migrated(phase, name)
+                    continue
                 self.logger.error("Failed to migrate volume %s: %s", name, exc)
                 self.report.record_failure("Volumes", name, str(exc))
                 self.ui.error(f"Volume '{name}' failed: {exc}")
@@ -2945,6 +4052,25 @@ class MigrationEngine:
             if self._is_migrated(phase, stack_id):
                 self.report.record_skip("Stacks", name, "already migrated")
                 continue
+            if self._leave_management_app("Stacks", name, stack_id, phase):
+                continue
+            if self._name_taken("projects", name):
+                if self._already_on_engine("projects", name):
+                    self.report.record_success(
+                        "Stacks", name, stack_id, name, status="adopted"
+                    )
+                    self.ui.info(
+                        f"Project '{name}' already on this engine -- left in place"
+                    )
+                else:
+                    self.report.record_skip(
+                        "Stacks", name, "already exists on target"
+                    )
+                    self.ui.info(
+                        f"Project '{name}' already exists on Arcane -- left in place"
+                    )
+                self._record_migrated(phase, stack_id)
+                continue
             try:
                 if self.config.import_mode:
                     # Read compose from exported directory instead of Portainer API
@@ -2970,6 +4096,7 @@ class MigrationEngine:
                 )
                 target_id = result.get("id", "") if isinstance(result, dict) else ""
                 self.report.record_success("Stacks", name, stack_id, target_id)
+                self._target_names.setdefault("projects", set()).add(name.lower())
                 if not self.config.dry_run:
                     self.report.add_rollback(
                         "DELETE",
@@ -2981,6 +4108,7 @@ class MigrationEngine:
                 self.logger.error("Failed to migrate stack %s: %s", name, exc)
                 self.report.record_failure("Stacks", name, str(exc))
                 self.ui.error(f"Stack '{name}' failed: {exc}")
+                self._stop_if_projects_directory_blocked(exc)
 
         self._mark_phase(phase, "completed")
 
@@ -3005,6 +4133,8 @@ class MigrationEngine:
             name = stack.get("Name", stack_id)
             if self._is_migrated(phase, stack_id):
                 self.report.record_skip("GitOps Syncs", name, "already migrated")
+                continue
+            if self._leave_management_app("GitOps Syncs", name, stack_id, phase):
                 continue
             repo_id = self._git_repo_map.get(stack_id)
             if not repo_id:
@@ -3034,6 +4164,7 @@ class MigrationEngine:
                 self.logger.error("Failed to create GitOps sync for %s: %s", name, exc)
                 self.report.record_failure("GitOps Syncs", name, str(exc))
                 self.ui.error(f"GitOps sync for '{name}' failed: {exc}")
+                self._stop_if_projects_directory_blocked(exc)
 
         self._mark_phase(phase, "completed")
 
@@ -3054,11 +4185,31 @@ class MigrationEngine:
 
         for c in containers:
             cid = c.get("Id", "")
-            # Use first name (strip leading /) or fall back to short id
-            names = c.get("Names", [])
-            name = names[0].lstrip("/") if names else cid[:12]
+            # List payloads use Names[]; inspect payloads (the export) use Name.
+            name = self._resource_name(c, "Names", "names", "Name", "name") or cid[:12]
             if self._is_migrated(phase, cid):
                 self.report.record_skip("Containers", name, "already migrated")
+                continue
+            if self._leave_management_app(
+                "Containers",
+                name,
+                cid,
+                phase,
+                container_image_ref(c),
+            ):
+                continue
+            if self._already_on_engine("containers", name):
+                # Recreating a container that is already running on this engine
+                # conflicts on the name and on published ports, and Podman
+                # returns that as a 500. Arcane already lists the container.
+                self.report.record_success(
+                    "Containers", name, cid, name, status="adopted"
+                )
+                self.ui.info(
+                    f"Container '{name}' is already running on this engine -- "
+                    "Arcane can manage it from Containers"
+                )
+                self._record_migrated(phase, cid)
                 continue
             try:
                 if self.config.import_mode:
@@ -3203,12 +4354,30 @@ class MigrationEngine:
                 continue
             try:
                 payload = self._transform_user(user)
+                role_id = str(payload.pop("roleId", "") or "")
                 result = self._execute_or_log(
                     f"Create user '{username}'",
                     self.arcane.create_user,
                     payload,
                 )
                 target_id = result.get("id", "") if isinstance(result, dict) else ""
+                if role_id and target_id and not self.config.dry_run:
+                    try:
+                        self.arcane.set_user_role_assignments(
+                            target_id, [{"roleId": role_id}]
+                        )
+                    except Exception as role_exc:
+                        self.logger.error(
+                            "User %s created but role %s was not assigned: %s",
+                            username, role_id, role_exc,
+                        )
+                        self.ui.warning(
+                            f"User '{username}' was created but role "
+                            f"'{role_id}' was not assigned: {role_exc}"
+                        )
+                        self.report.add_action_item(
+                            f"Assign the {role_id} role to '{username}' in Arcane"
+                        )
                 self.report.record_success("Users", username, uid, target_id)
                 if not self.config.dry_run:
                     self.report.add_rollback(
@@ -3383,24 +4552,131 @@ class MigrationEngine:
                 "details": f"Cannot access Arcane environment: {exc}",
             })
 
-        # 3. Naming conflicts
+        # 3. Engine on each server. Portainer and Arcane can differ.
+        engine_error = ""
         try:
-            eid = self.config.arcane_environment_id or "0"
-            existing_projects = self.arcane.list_projects(eid)
-            existing_names = {
-                p.get("name", "").lower() for p in existing_projects
-            }
-            portainer_stacks = self.discovery.get("stacks", {}).get("data", [])
-            conflicts = [
-                s.get("Name", s.get("name", ""))
-                for s in portainer_stacks
-                if s.get("Name", s.get("name", "")).lower() in existing_names
-            ]
-            if conflicts:
+            self._refresh_target_engine()
+        except Exception as exc:
+            engine_error = str(exc)
+
+        if self.source_engine_kind:
+            results.append({
+                "name": "Portainer Engine",
+                "status": "pass",
+                "details": engine_summary(
+                    self.source_engine_kind, self.source_engine_info
+                ),
+            })
+        else:
+            details = "Portainer did not return engine info"
+            if engine_error:
+                details = f"{details}: {engine_error}"
+            results.append({
+                "name": "Portainer Engine",
+                "status": "warn",
+                "details": details,
+            })
+
+        target_summary = engine_summary(self.engine_kind, self.engine_info)
+        if not self.engine_kind:
+            details = "Arcane did not return engine info"
+            if engine_error:
+                details = f"{details}: {engine_error}"
+            results.append({
+                "name": "Arcane Engine",
+                "status": "warn",
+                "details": details,
+            })
+        elif self.same_engine:
+            results.append({
+                "name": "Arcane Engine",
+                "status": "warn",
+                "details": (
+                    f"{target_summary}. Same engine confirmed "
+                    f"({self.engine_match_reason}). In-place reuse is on."
+                ),
+            })
+        elif self.engine_proven:
+            results.append({
+                "name": "Arcane Engine",
+                "status": "warn",
+                "details": (
+                    f"{target_summary}. Same engine confirmed "
+                    f"({self.engine_match_reason}). In-place reuse was declined."
+                ),
+            })
+        else:
+            extra = ""
+            if (
+                self.source_engine_kind
+                and self.source_engine_kind != self.engine_kind
+            ):
+                extra = " Container mounts will be translated for this engine."
+            reason = self.engine_match_reason
+            status = "pass"
+            if engine_error:
+                status = "warn"
+                reason = f"{reason}. {engine_error}".strip(". ")
+            details = target_summary
+            if reason:
+                details = f"{details}. {reason}."
+            if extra:
+                details = f"{details}{extra}"
+            results.append({
+                "name": "Arcane Engine",
+                "status": status,
+                "details": details.strip(),
+            })
+
+        # 4. Naming conflicts
+        try:
+            # Networks, volumes, and projects are skipped when the name
+            # already exists. A container is left in place only after the
+            # user accepts same-engine reuse. Otherwise create still runs.
+            left_in_place = []
+            containers_created = []
+            for kind, source_key, label in (
+                ("projects", "stacks", "stack"),
+                ("networks", "networks", "network"),
+                ("volumes", "volumes", "volume"),
+                ("containers", "standalone_containers", "container"),
+            ):
+                taken = self._target_names.get(kind, set())
+                items = self.discovery.get(source_key, {}).get("data", []) or []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    if kind == "containers":
+                        item_name = self._resource_name(
+                            item, "Names", "names", "Name", "name"
+                        )
+                    elif kind == "volumes":
+                        item_name = item.get("Name") or item.get("name") or ""
+                    else:
+                        item_name = item.get("Name") or item.get("name") or ""
+                    if not item_name or item_name.lower() not in taken:
+                        continue
+                    entry = f"{label} {item_name}"
+                    if kind == "containers" and not self.same_engine:
+                        containers_created.append(entry)
+                    else:
+                        left_in_place.append(entry)
+            details_parts = []
+            if left_in_place:
+                details_parts.append(
+                    "Already on Arcane, will be left in place: "
+                    + ", ".join(left_in_place)
+                )
+            if containers_created:
+                details_parts.append(
+                    "Still created, because in-place reuse is off: "
+                    + ", ".join(containers_created)
+                )
+            if details_parts:
                 results.append({
                     "name": "Naming Conflicts",
                     "status": "warn",
-                    "details": f"Conflicting stack names: {', '.join(conflicts)}",
+                    "details": ". ".join(details_parts),
                 })
             else:
                 results.append({
@@ -3448,6 +4724,12 @@ class MigrationEngine:
 
     def run(self, args=None):
         """Run the full migration wizard."""
+        # Set once the report is saved and every phase is complete, so a
+        # later display error cannot relabel a finished migration as failed
+        # or rewrite the checkpoint.
+        migration_finished = False
+        exit_code = 0
+        stopped_reason = ""
         try:
             # ── Phase 0: Welcome ──────────────────────────────────
             self.ui.banner()
@@ -3484,9 +4766,6 @@ class MigrationEngine:
                 self.ui.phase_header("1", self.PHASE_TOTAL, "Connection Setup (Import Mode)")
                 self.ui.info(f"Import mode: loading from {import_dir}")
                 self.ui.info("Portainer connection skipped (not needed in import mode)")
-
-                # Mark Portainer-only phases as completed
-                self._mark_phase("portainer_backup", "completed")
 
                 # Arcane connection (still required)
                 self.ui.ask_arcane_connection()
@@ -3530,9 +4809,10 @@ class MigrationEngine:
                     self.config.arcane_environment_id = "0"
                     self.ui.info("Using default Arcane environment (0)")
 
-                # Recompute config_hash now that connection details are known
-                self.state["config_hash"] = self.config.config_hash()
-                self._save_state()
+                # Reload the checkpoint now that the Arcane environment is known.
+                # Saving earlier would replace the file with an empty-connection hash.
+                self._attach_checkpoint()
+                self._mark_phase("portainer_backup", "completed")
 
                 # ── Phase 2: Discovery from disk ──────────────────
                 self.ui.phase_header(2, self.PHASE_TOTAL, "Discovery (Import Mode)")
@@ -3541,6 +4821,12 @@ class MigrationEngine:
                 except Exception as exc:
                     self.ui.error(f"Failed to import from directory: {exc}")
                     return
+
+                # Source kind comes from the export. Arcane is classified live.
+                try:
+                    self._load_engine_sides()
+                except Exception as exc:
+                    self.logger.warning("Engine detection failed: %s", exc)
 
                 # Mark EE-only phases as completed on CE
                 if not self._is_ee():
@@ -3580,12 +4866,6 @@ class MigrationEngine:
                 except Exception as exc:
                     self.ui.error(f"Cannot detect Portainer edition: {exc}")
                     return
-
-                # Mark EE-only phases as completed on CE so all-done check works
-                if not self._is_ee():
-                    for phase in ["ee_rbac_export", "ee_audit_export"]:
-                        if self._phase_status(phase) == "pending":
-                            self._mark_phase(phase, "completed")
 
                 try:
                     endpoints = self.portainer.list_endpoints()
@@ -3641,9 +4921,19 @@ class MigrationEngine:
                     self.config.arcane_environment_id = "0"
                     self.ui.info("Using default Arcane environment (0)")
 
-                # Recompute config_hash now that connection details are known
-                self.state["config_hash"] = self.config.config_hash()
-                self._save_state()
+                try:
+                    self._load_engine_sides()
+                except Exception as exc:
+                    self.logger.warning("Engine detection failed: %s", exc)
+
+                # Reload the checkpoint now that both endpoints are known.
+                # The load at startup ran before the URLs existed.
+                self._attach_checkpoint()
+                # Mark EE-only phases as completed on CE so all-done check works
+                if not self._is_ee():
+                    for phase in ["ee_rbac_export", "ee_audit_export"]:
+                        if self._phase_status(phase) == "pending":
+                            self._mark_phase(phase, "completed")
 
                 # ── Phase 1.5: Portainer Backup ───────────────────
                 skip_backup = args and getattr(args, "skip_backup", False)
@@ -3707,6 +4997,14 @@ class MigrationEngine:
                 self.ui.info("Import mode: skipping export (data already on disk)")
 
             if self.config.strategy == "live":
+                # Discovery is loaded by now, so same-engine adoption can see
+                # the source names. Preflight may have done this already.
+                try:
+                    self._refresh_target_engine()
+                except Exception as exc:
+                    self.logger.warning("Engine detection failed: %s", exc)
+                # Ask before the progress bar. The default is to skip.
+                self._skip_management_apps()
                 # Build phase list dynamically
                 core_phases = [
                     ("5a: Registries", self._migrate_registries),
@@ -3740,6 +5038,15 @@ class MigrationEngine:
                         progress.update(task, description=f"[cyan]{label}[/]")
                         try:
                             fn()
+                        except MigrationStopped as exc:
+                            # The panel was already shown. Do not ask to
+                            # continue: later project creates fail the same way.
+                            stopped_reason = str(exc)
+                            self.logger.error(
+                                "Migration stopped during %s: %s", label, exc
+                            )
+                            self._save_state()
+                            break
                         except Exception as exc:
                             self.ui.error(f"{label} failed: {exc}")
                             self.logger.exception("Phase %s failed", label)
@@ -3759,36 +5066,34 @@ class MigrationEngine:
             self.ui.show_final_report(
                 self.report.report, self.config.portainer_edition
             )
-            if rollback_file:
-                self.ui.info(f"Rollback script: {rollback_file}")
-                # The generated script ships with a placeholder API key so
-                # no credentials are written to disk. Users must paste
-                # their Arcane key before running it, otherwise every
-                # curl call 401s silently from inside `set -euo pipefail`.
-                self.console.print(
-                    "\n[bold yellow]Before running rollback:[/bold yellow]\n"
-                    f"  1. Edit [cyan]{rollback_file}[/cyan] and replace "
-                    "[magenta]YOUR_API_KEY_HERE[/magenta] with your Arcane API key.\n"
-                    f"  2. Review the DELETE commands — rollback is destructive.\n"
-                    f"  3. Run: [cyan]bash {rollback_file}[/cyan]"
-                )
 
-            # Check if all phases completed
+            # Check if all phases completed before any closing instructions.
+            # Those instructions are display-only. A failure there must not
+            # turn a finished migration into "Migration failed".
             all_done = all(
                 status == "completed"
                 for status in self.state.get("phases", {}).values()
             )
             if all_done:
-                # Clean up checkpoint file
                 try:
                     os.remove(self.config.checkpoint_file)
                 except FileNotFoundError:
                     pass
                 self.ui.success("Migration completed!")
+                migration_finished = True
+            elif stopped_reason:
+                exit_code = 1
+                self.ui.warning(
+                    "Migration stopped. Fix the projects directory permissions "
+                    "on the Arcane host, then run with --resume."
+                )
             else:
                 self.ui.warning(
                     "Some phases incomplete. Run with --resume to continue."
                 )
+
+            if rollback_file:
+                self.ui.show_rollback_instructions(rollback_file)
 
         except KeyboardInterrupt:
             self._save_state()
@@ -3797,8 +5102,14 @@ class MigrationEngine:
             )
         except Exception as exc:
             self.logger.exception("Unhandled error in migration engine")
-            self.ui.error(f"Migration failed: {exc}")
-            self._save_state()
+            if migration_finished:
+                self.ui.warning(
+                    "Migration already finished. "
+                    f"The closing message failed: {exc}"
+                )
+            else:
+                self.ui.error(f"Migration failed: {exc}")
+                self._save_state()
         finally:
             # Close HTTP sessions so connections aren't held open during
             # the terminal restoration that follows a Rich alternate-screen
@@ -3808,6 +5119,7 @@ class MigrationEngine:
                     client.session.close()
                 except Exception:
                     pass
+        return exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -3923,7 +5235,9 @@ if __name__ == "__main__":
 
     try:
         engine = MigrationEngine(config, logger)
-        engine.run(args=args)
+        code = engine.run(args=args)
+        if code:
+            sys.exit(code)
     except KeyboardInterrupt:
         console.print("\n[yellow]Migration interrupted. Run with --resume to continue.[/]")
         sys.exit(130)

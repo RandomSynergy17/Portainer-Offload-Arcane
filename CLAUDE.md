@@ -24,7 +24,7 @@ migrate.py
 
 ## Key Design Decisions
 
-- **Single file**: Easy to distribute. Run anywhere with `pip install rich requests && python migrate.py`.
+- **Single file**: Easy to distribute. `python migrate.py` or `./migrate.sh` creates a `.venv` next to the script and installs `rich` and `requests` there. If the stdlib `venv` module is missing, the tool tells the user to install `python3-venv`.
 - **CE/EE auto-detect**: `GET /api/status` returns edition. EE-only endpoints use `_safe_get()` which returns empty on 404/403 instead of crashing. CE users never see EE features.
 - **Checkpoint/resume**: State saved to `migration_state.json` after each sub-phase. Each item tracked individually. Resume skips completed phases.
 - **Dry-run**: Every write wraps in `_execute_or_log()`. All reads happen normally; only writes are suppressed.
@@ -44,8 +44,9 @@ migrate.py
 - Base URL: `{arcane_url}/api`
 - Auth: `X-API-Key` header OR `Authorization: Bearer {jwt}`
 - Environment ID "0" = local environment
-- Projects (stacks): `POST /environments/{id}/projects` with `composeContent` + `envContent`
+- Projects (stacks): `POST /environments/{id}/projects` as multipart form parts `project` and `manifest` (both JSON). `project` carries `name`, `composeContent`, and `envContent`. Arcane 2.x rejects a JSON body with 422.
 - Env vars are a raw `.env` string in `envContent` field, not an array
+- Same engine (Docker or Podman): adopt networks, volumes, and containers in place only after the user confirms, and only when a full 64-hex container or network ID exists on both APIs, or both Docker info IDs are equal. Names are not identity. Podman `/info` IDs are random per call, so an ID mismatch is not proof of a different host. Podman reports `DockerRootDir` under `/var/lib/containers`. Do not copy volume data and do not emit rollback deletes for adopted resources.
 
 ## Common Operations
 

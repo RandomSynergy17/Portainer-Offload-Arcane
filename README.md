@@ -48,8 +48,10 @@ if needed, detects Docker availability, and drops you into the wizard.
 It asks for your Portainer URL, API key, and Arcane credentials, then
 does the rest.
 
-> **Alternative:** If you prefer to manage dependencies yourself, you can
-> run `pip install rich requests && python migrate.py` directly.
+> **Alternative:** `python migrate.py` does the same. When `rich` and
+> `requests` are missing it creates a `.venv` next to the script and
+> installs them there. On Debian/Ubuntu, install `python3-venv` first
+> if Python reports that the venv module is missing.
 
 ---
 
@@ -129,8 +131,8 @@ dependency checks automatically, then forwards everything to `migrate.py`:
 ./migrate.sh --help
 ```
 
-> **Direct Python:** Every command above also works with `python migrate.py`
-> if you've installed `rich` and `requests` yourself.
+> **Direct Python:** Every command above also works with `python migrate.py`.
+> Missing packages are installed into `.venv` beside the script.
 
 ---
 
@@ -139,7 +141,7 @@ dependency checks automatically, then forwards everything to `migrate.py`:
 | Requirement | Notes |
 |-------------|-------|
 | Python 3.8+ | Auto-detected by the launcher |
-| `rich` + `requests` | Auto-installed on first run if missing |
+| `rich` + `requests` | Installed into `.venv` on first run if missing |
 | Portainer API key | Generate in Portainer > My Account > Access Tokens |
 | Arcane API key or login | Admin credentials for the target instance |
 | Docker CLI *(optional)* | Enables volume data backup when running on the host |
